@@ -52,6 +52,38 @@ let
     hostConfig = config;
   };
 
+  # What of `derivedFrom` can be hashed at EVALUATION time.
+  #
+  # A plain value is hashed as itself. An entry naming another secret is
+  # hashed as that secret's `id`: its CONTENT is not readable here, since
+  # nothing has been decrypted yet, but WHICH secret it is, is. So retargeting
+  # a dependency moves the filename, while a rotation of the same dependency
+  # keeps it and is caught by the `<file>.derived-from` stamp in
+  # apps/generate.nix instead -- the two halves cover the two ways a reference
+  # can change.
+  #
+  # Reading `id` cannot recurse into the referenced secret's own `rekeyFile`:
+  # it defaults to the attribute name and is `readOnly`, so it is not computed
+  # from anything.
+  derivedHashable =
+    generator:
+    mapAttrs (
+      _: v: if isAttrs v && v ? rekeyFile && v.rekeyFile != null then { inherit (v) id; } else v
+    ) generator.derivedFrom;
+
+  # Eight hex characters: this discriminates between a handful of variants of
+  # one secret, it is not a security boundary, and a full sha256 in every path
+  # makes a generated-secrets directory unreadable.
+  derivedNameSuffix =
+    generator:
+    let
+      hashable = derivedHashable generator;
+    in
+    if hashable == { } then
+      ""
+    else
+      "-" + builtins.substring 0 8 (builtins.hashString "sha256" (builtins.toJSON hashable));
+
   # A decryptable dummy secret that is used as a replacement when a secret specifies `intermediary = true`.
   pubkeyOpt = x: if isAbsolutePath x then "-R ${escapeShellArg x}" else "-r ${escapeShellArg x}";
   dummySecret = pkgs.runCommand "generate-dummy-secret-${target}.age" { } ''
@@ -185,6 +217,51 @@ let
             config.age.generators.${submod.config.script}
           else
             submod.config.script;
+      };
+
+      derivedFrom = mkOption {
+        type = types.attrsOf types.unspecified;
+        default = { };
+        example = literalExpression ''
+          {
+            scope = {
+              pull = [ "main" ];
+              push = [ "main" ];
+            };
+            signingKey = config.age.secrets.signing_key;
+          }
+        '';
+        description = ''
+          What this secret is a function of. It is regenerated whenever any of
+          these changes, rather than only when its file is missing.
+
+          Each value is either a plain, JSON-representable value or another
+          secret definition (anything carrying a `rekeyFile`). The two are
+          handled differently, because only one of them can be read before
+          anything has been decrypted:
+
+          - Plain values are hashed at EVALUATION time and folded into the
+            default `rekeyFile` name, so a change leaves no file at the new
+            path and the ordinary "generate what is missing" rule mints it.
+            The previous secret stays on disk, so what is already deployed
+            keeps working until the new one is. A secret that sets `rekeyFile`
+            explicitly opts out of this and relies on the stamp below.
+
+          - A named secret contributes twice. Its `id` joins the
+            evaluation-time hash above, so pointing the entry at a DIFFERENT
+            secret moves the filename. Its encrypted FILE is hashed while
+            `agenix generate` runs, after that secret has itself been
+            regenerated (dependencies are ordered first); that hash is
+            recorded beside the generated secret as `<rekeyFile>.derived-from`
+            and a mismatch forces regeneration in place, which is what catches
+            the same secret being rotated. age encryption is not
+            deterministic, so naming a secret here means "whenever that secret
+            is regenerated", not "whenever its plaintext changes".
+
+          Stronger than `dependencies`, which only orders generation and
+          compares mtimes -- and a value that is not a secret cannot be
+          expressed as a dependency at all.
+        '';
       };
 
       tags = mkOption {
@@ -367,7 +444,8 @@ in
               default =
                 if submod.config.generator != null then
                   if config.age.rekey.generatedSecretsDir != null then
-                    config.age.rekey.generatedSecretsDir + "/${submod.config.id}.age"
+                    config.age.rekey.generatedSecretsDir
+                    + "/${submod.config.id}${derivedNameSuffix submod.config.generator}.age"
                   else
                     null
                 else if config.age.rekey.secretsDir != null then

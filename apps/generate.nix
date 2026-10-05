@@ -41,6 +41,18 @@ let
       "Cannot generate ${fileStr} as it isn't a direct subpath of the flake directory ${userFlakeDir}, meaning this script cannot determine its true origin!";
     "." + removePrefix userFlakeDir fileStr;
 
+  # A `derivedFrom` entry is either another secret -- hashed from its file when the
+  # script runs, so it reflects the regeneration that just happened -- or a
+  # plain value, hashed here at evaluation time.
+  isSecretRef = v: builtins.isAttrs v && v ? rekeyFile && v.rekeyFile != null;
+  derivedSecretFiles =
+    generator: map (v: relativeToFlake v.rekeyFile) (filter isSecretRef (attrValues generator.derivedFrom));
+  derivedValueHash =
+    generator:
+    builtins.hashString "sha256" (
+      builtins.toJSON (filterAttrs (_: v: !isSecretRef v) generator.derivedFrom)
+    );
+
   mapListOrAttrs = f: x: if builtins.isList x then map f x else mapAttrs (_: f) x;
   mapListOrAttrValues = f: x: if builtins.isList x then map f x else mapAttrsToList (_: f) x;
   filterListOrAttrValues = f: x: if builtins.isList x then filter f x else filterAttrs (_: f) x;
@@ -118,6 +130,8 @@ let
             secretName
             script
             ;
+          derivedFiles = derivedSecretFiles secret.generator;
+          derivedHash = derivedValueHash secret.generator;
           defs = (set.${sourceFile}.defs or [ ]) ++ [ "${host}:${secretName}" ];
         };
       };
@@ -131,6 +145,40 @@ let
   # The command that actually generates a secret.
   secretGenerationCommand = contextSecret: ''
     if wants_secret ${escapeShellArg contextSecret.sourceFile} ${escapeShellArg (concatStringsSep "," contextSecret.secret.generator.tags)} ; then
+      # `derivedFrom`: this secret is a function of the values and secrets named
+      # there, so it is stale as soon as their combined hash moves. The hash
+      # lives beside it in <file>.derived-from.
+      #
+      # Staleness is expressed by backdating the target rather than by widening
+      # the condition below: the existing rule already regenerates anything
+      # older than its newest dependency, and `dep_mtimes` always holds a 1, so
+      # an mtime of 0 is unconditionally stale. Nothing is deleted, so a
+      # generator that fails leaves the previous secret intact.
+      derived_stamp=""
+      ${
+        if contextSecret.secret.generator.derivedFrom == { } then
+          ""
+        else
+          ''
+            derived_stamp="$(
+              {
+                printf '%s\n' ${escapeShellArg contextSecret.derivedHash}
+                ${concatStringsSep "\n" (
+                  map (
+                    f: "${pkgs.coreutils}/bin/sha256sum ${escapeShellArg f} 2>/dev/null || echo ${escapeShellArg "missing ${f}"}"
+                  ) contextSecret.derivedFiles
+                )}
+              } | ${pkgs.coreutils}/bin/sha256sum | ${pkgs.coreutils}/bin/cut -d' ' -f1
+            )"
+            if [[ -e ${escapeShellArg contextSecret.sourceFile} ]] \
+              && [[ "$derived_stamp" != "$(${pkgs.coreutils}/bin/cat ${
+                escapeShellArg (contextSecret.sourceFile + ".derived-from")
+              } 2>/dev/null || echo "")" ]]; then
+              ${pkgs.coreutils}/bin/touch -d @0 ${escapeShellArg contextSecret.sourceFile}
+            fi
+          ''
+      }
+
       # If the secret has dependencies, force regeneration if any
       # dependency was modified since its last generation
       dep_mtimes=(
@@ -158,9 +206,17 @@ let
         } | ${ageMasterEncrypt} -o ${escapeShellArg contextSecret.sourceFile} \
           || die "Failed to generate or encrypt secret."
 
+        if [[ -n "$derived_stamp" ]]; then
+          printf '%s\n' "$derived_stamp" > ${escapeShellArg (contextSecret.sourceFile + ".derived-from")}
+        fi
+
         if [[ "$ADD_TO_GIT" == true ]]; then
           git add ${escapeShellArg contextSecret.sourceFile} \
             || die "Failed to add generated secret to git"
+          if [[ -n "$derived_stamp" ]]; then
+            git add ${escapeShellArg (contextSecret.sourceFile + ".derived-from")} \
+              || die "Failed to add derivation stamp to git"
+          fi
         fi
       else
         echo "[1;90m    Skipping[m [90m[already exists] "${escapeShellArg contextSecret.sourceFile}" ("${concatStringsSep "', '" (map escapeShellArg contextSecret.defs)}")[m"
