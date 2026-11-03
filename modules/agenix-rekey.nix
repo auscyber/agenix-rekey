@@ -136,6 +136,11 @@ let
           are rekeyed via the same flake.
         '';
       };
+      value = mkOption {
+        type = types.nullOr (types.functionTo types.anything);
+        default = null;
+        description = "This function will take deps and pass it to the script as 'value' parameter.";
+      };
 
       script = mkOption {
         type = types.either types.str (types.functionTo types.str);
